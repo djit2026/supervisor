@@ -1,0 +1,15 @@
+# Binaries
+*.exe
+*.out
+*.test
+
+# Go build
+bin/
+dist/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
