@@ -1,6 +1,6 @@
 package supervisor
 
-type WorkerMetrics struct {
+type workerMetrics struct {
 	Restarts    int64
 	Failures    int64
 	Success     int64

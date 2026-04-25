@@ -5,8 +5,10 @@ import (
 	"time"
 )
 
+// WorkerFunc is the function executed by a supervised worker.
 type WorkerFunc func(ctx context.Context, hb func()) error
 
+// WorkerSpec configures a supervised worker.
 type WorkerSpec struct {
 	Name                string
 	Run                 WorkerFunc

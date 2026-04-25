@@ -11,11 +11,15 @@ import (
 type Strategy int
 
 const (
+	// OneForOne restarts only the failed worker.
 	OneForOne Strategy = iota
+	// OneForAll restarts all active workers when one worker fails.
 	OneForAll
+	// RestForOne restarts the failed worker and workers added after it.
 	RestForOne
 )
 
+// Supervisor manages a set of worker goroutines.
 type Supervisor struct {
 	mu          sync.Mutex
 	workers     []*workerRuntime
@@ -46,6 +50,7 @@ type restartBarrier struct {
 	ordered      bool
 }
 
+// NewSupervisor creates a supervisor with the supplied options.
 func NewSupervisor(opts ...Option) *Supervisor {
 	readyCh := make(chan struct{})
 	close(readyCh)
@@ -65,25 +70,34 @@ func NewSupervisor(opts ...Option) *Supervisor {
 	return s
 }
 
-func (s *Supervisor) Add(spec WorkerSpec) {
+// Add registers a worker. It must be called before Start.
+func (s *Supervisor) Add(spec WorkerSpec) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if s.started {
-		panic("cannot add workers after Start")
+		return fmt.Errorf("cannot add workers after start")
+	}
+	if spec.Name == "" {
+		return fmt.Errorf("worker name is required")
+	}
+	if spec.Run == nil {
+		return fmt.Errorf("worker %q run function is required", spec.Name)
 	}
 
 	rt := &workerRuntime{
 		spec: spec,
-		state: WorkerState{
+		state: workerState{
 			Name:   spec.Name,
 			Status: StatusStarting,
 		},
 	}
 
 	s.workers = append(s.workers, rt)
+	return nil
 }
 
+// Start runs all registered workers and blocks until they exit.
 func (s *Supervisor) Start(parent context.Context) error {
 	s.mu.Lock()
 
@@ -92,7 +106,10 @@ func (s *Supervisor) Start(parent context.Context) error {
 		return fmt.Errorf("already started")
 	}
 
-	// supervisor context
+	if parent == nil {
+		parent = context.Background()
+	}
+
 	s.ctx, s.cancel = context.WithCancel(parent)
 	s.started = true
 
@@ -113,6 +130,7 @@ func (s *Supervisor) Start(parent context.Context) error {
 	return nil
 }
 
+// Stop cancels the supervisor context.
 func (s *Supervisor) Stop() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -128,18 +146,20 @@ func (s *Supervisor) Stop() error {
 	return nil
 }
 
+// Subscribe returns the lifecycle event stream.
 func (s *Supervisor) Subscribe() <-chan Event {
 	return s.events
 }
 
-func (s *Supervisor) Metrics() []WorkerSnapshot {
+// Metrics returns a copy of each worker's counters.
+func (s *Supervisor) Metrics() []WorkerMetricsSnapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	var out []WorkerSnapshot
+	var out []WorkerMetricsSnapshot
 
 	for _, w := range s.workers {
-		out = append(out, WorkerSnapshot{
+		out = append(out, WorkerMetricsSnapshot{
 			Name:     w.spec.Name,
 			Restarts: atomic.LoadInt64(&w.metrics.Restarts),
 			Failures: atomic.LoadInt64(&w.metrics.Failures),

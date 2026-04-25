@@ -21,16 +21,14 @@ It is inspired by supervision trees: each worker is declared with a `WorkerSpec`
 This repository currently uses the module path:
 
 ```bash
-go get supervisor
+go get github.com/djit2026/supervisor
 ```
 
-For local development, import it as:
+Import it as:
 
 ```go
-import "supervisor"
+import "github.com/djit2026/supervisor"
 ```
-
-If you publish this module, replace the module path in `go.mod` with your repository URL, then import that path instead.
 
 ## Quick Start
 
@@ -42,7 +40,7 @@ import (
 	"fmt"
 	"time"
 
-	"supervisor"
+	"github.com/djit2026/supervisor"
 )
 
 func main() {
@@ -115,14 +113,16 @@ sup := supervisor.NewSupervisor(
 Add workers before calling `Start`:
 
 ```go
-sup.Add(supervisor.WorkerSpec{
+if err := sup.Add(supervisor.WorkerSpec{
 	Name:    "worker",
 	Restart: supervisor.RestartOnFailure,
 	Run: func(ctx context.Context, hb func()) error {
 		// do work
 		return nil
 	},
-})
+}); err != nil {
+	return err
+}
 ```
 
 `Start(ctx)` blocks until the supervisor context is cancelled or all worker goroutines exit.
@@ -371,7 +371,7 @@ go test -count=1 ./...
 
 ## Notes
 
-- Add all workers before calling `Start`; adding workers after start panics.
+- Add all workers before calling `Start`; adding workers after start returns an error.
 - `Start` closes the event channel when all worker goroutines have exited.
 - Event delivery is buffered and non-blocking. If the event buffer is full, events may be dropped.
 - Workers should cooperate with cancellation. A worker that ignores `ctx.Done()` can delay coordinated restarts.

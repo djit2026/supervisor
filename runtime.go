@@ -9,11 +9,11 @@ import (
 
 type workerRuntime struct {
 	spec         WorkerSpec
-	state        WorkerState
+	state        workerState
 	mu           sync.Mutex
 	instanceID   int64
 	restartTimes []time.Time
-	metrics      WorkerMetrics
+	metrics      workerMetrics
 	ctx          context.Context
 	cancel       context.CancelFunc
 }
