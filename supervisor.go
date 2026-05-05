@@ -378,7 +378,7 @@ func (s *Supervisor) runWorker(w *workerRuntime) {
 			})
 
 			// Apply backoff before signalling.
-			if !s.applyBackoff(w, instanceID, ctx) {
+			if !s.applyBackoff(w, instanceID) {
 				return
 			}
 
@@ -428,7 +428,7 @@ func (s *Supervisor) runWorker(w *workerRuntime) {
 				Restarts:   w.getRestarts(),
 			})
 
-			if !s.applyBackoff(w, instanceID, ctx) {
+			if !s.applyBackoff(w, instanceID) {
 				return
 			}
 			s.openGate(w)
@@ -440,9 +440,10 @@ func (s *Supervisor) runWorker(w *workerRuntime) {
 		reason := classifyReason(errorKind)
 		w.setRestartReason(reason)
 
-		// Apply backoff before the coordinated restart so siblings aren't
+		// For coordinated restarts, we apply backoff before triggering the cycle,
+		// so that the whole restart set is delayed together, rather than being
 		// held up needlessly by one worker's backoff.
-		if !s.applyBackoff(w, instanceID, ctx) {
+		if !s.applyBackoff(w, instanceID) {
 			return
 		}
 
@@ -454,7 +455,7 @@ func (s *Supervisor) runWorker(w *workerRuntime) {
 
 // applyBackoff sleeps for the configured backoff duration.
 // Returns false if the supervisor shut down during the sleep (caller should return).
-func (s *Supervisor) applyBackoff(w *workerRuntime, instanceID int64, ctx context.Context) bool {
+func (s *Supervisor) applyBackoff(w *workerRuntime, instanceID int64) bool {
 	if w.spec.Backoff == nil {
 		return true
 	}
@@ -581,8 +582,8 @@ func (s *Supervisor) runRestartCycle(req restartRequest) {
 
 	// Wait for all workers in the restart set to have reached the gate
 	// (i.e., they have finished their current run and are blocked waiting).
-	// Uses the atGate flag rather than isStopped to correctly handle the
-	// trigger worker which exited without cancellation. (Bug 1.1 fix)
+	// We use the atGate flag to correctly handle the trigger worker which 
+	// exited without cancellation, as well as cancelled siblings. (Bug 1.1 fix)
 	deadline := time.Now().Add(s.barrierTimeout)
 	allStoppedCh := make(chan struct{})
 
@@ -622,6 +623,7 @@ func (s *Supervisor) runRestartCycle(req restartRequest) {
 	type workerDecision struct {
 		w         *workerRuntime
 		willReset bool
+		lastErr   error
 	}
 	decisions := make([]workerDecision, 0, len(toRestart))
 	for _, w := range toRestart {
@@ -630,7 +632,7 @@ func (s *Supervisor) runRestartCycle(req restartRequest) {
 		w.mu.Unlock()
 
 		willRestart := s.shouldRestart(w, lastErr) && w.allowRestart()
-		decisions = append(decisions, workerDecision{w: w, willReset: willRestart})
+		decisions = append(decisions, workerDecision{w: w, willReset: willRestart, lastErr: lastErr})
 	}
 
 	// Emit EventRestarted for all workers that WILL restart, before opening any gate.
@@ -662,7 +664,7 @@ func (s *Supervisor) runRestartCycle(req restartRequest) {
 			d.w.permanentStop = true
 			d.w.mu.Unlock()
 
-			if !s.shouldRestart(d.w, d.w.state.LastError) {
+			if !s.shouldRestart(d.w, d.lastErr) {
 				s.emit(Event{
 					Worker:     d.w.spec.Name,
 					InstanceID: instanceIDs[d.w.workerID],

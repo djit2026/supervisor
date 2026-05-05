@@ -116,15 +116,6 @@ func (w *workerRuntime) setAtGate(v bool) {
 	w.mu.Unlock()
 }
 
-// isStopped reports whether the worker's current execution instance has
-// already exited. Uses instanceCtx.Err() rather than Status, because Status
-// may still be "Running" mid-transition. (Bug 1.3 fix)
-func (w *workerRuntime) isStopped() bool {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.instanceCtx == nil || w.instanceCtx.Err() != nil
-}
-
 func (w *workerRuntime) heartbeat() {
 	w.mu.Lock()
 	defer w.mu.Unlock()

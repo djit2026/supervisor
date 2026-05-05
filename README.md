@@ -276,6 +276,9 @@ type BackoffStrategy interface {
 }
 ```
 
+> [!NOTE]
+> When using coordinated restart strategies (`OneForAll` or `RestForOne`), if the worker that triggers the restart has a backoff configured, the entire coordinated restart cycle is delayed by that backoff duration. This ensures all affected workers stop and restart synchronously, rather than staggering their restarts.
+
 ## Restart Limits
 
 Stop restarting after an absolute limit:
