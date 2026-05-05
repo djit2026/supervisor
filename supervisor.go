@@ -8,6 +8,7 @@ import (
 	"time"
 )
 
+// Strategy controls which workers are restarted when one worker fails.
 type Strategy int
 
 const (
@@ -15,50 +16,57 @@ const (
 	OneForOne Strategy = iota
 	// OneForAll restarts all active workers when one worker fails.
 	OneForAll
-	// RestForOne restarts the failed worker and workers added after it.
+	// RestForOne restarts the failed worker and all workers registered after it.
 	RestForOne
 )
 
-// Supervisor manages a set of worker goroutines.
-type Supervisor struct {
-	mu          sync.Mutex
-	workers     []*workerRuntime
-	wg          sync.WaitGroup
-	started     bool
-	events      chan Event
-	eventBuffer int
-	ctx         context.Context
-	cancel      context.CancelFunc
-	strategy    Strategy
-	restartCh   chan struct{}
-	readyCh     chan struct{}
-	restartHold bool
-	barrier     *restartBarrier
+const (
+	defaultBarrierTimeout    = 30 * time.Second
+	defaultHeartbeatInterval = time.Second
+)
+
+// restartRequest is posted to the centralized restart loop when a worker
+// under OneForAll or RestForOne strategy fails.
+type restartRequest struct {
+	trigger *workerRuntime
+	reason  RestartReason
 }
 
-type restartBarrier struct {
-	pending      map[*workerRuntime]struct{}
-	restartGates map[*workerRuntime]chan struct{}
-	startGates   map[*workerRuntime]chan struct{}
-	execGates    map[*workerRuntime]chan struct{}
-	restarted    map[*workerRuntime]struct{}
-	started      map[*workerRuntime]struct{}
-	skipped      map[*workerRuntime]struct{}
-	order        []*workerRuntime
-	nextRestart  int
-	nextStart    int
-	ordered      bool
+// Supervisor manages a set of worker goroutines.
+type Supervisor struct {
+	mu      sync.Mutex
+	workers []*workerRuntime
+	// workersByID provides O(1) lookup by stable string ID. (Bug 1.5 fix)
+	workersByID map[string]*workerRuntime
+
+	wg      sync.WaitGroup
+	started bool
+
+	events        chan Event
+	eventBuffer   int
+	droppedEvents int64 // atomic counter for dropped events
+
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	strategy Strategy
+
+	// restartCh carries at most one pending coordinated restart at a time.
+	// Duplicates are coalesced via restartPending. (Bug 1.4 fix, Improvement 3.4)
+	restartCh      chan restartRequest
+	restartPending bool // guarded by mu
+
+	barrierTimeout    time.Duration // max wait for all workers to stop (Bug 1.1 fix)
+	heartbeatInterval time.Duration // polling interval for heartbeat watchdog
 }
 
 // NewSupervisor creates a supervisor with the supplied options.
 func NewSupervisor(opts ...Option) *Supervisor {
-	readyCh := make(chan struct{})
-	close(readyCh)
-
 	s := &Supervisor{
-		eventBuffer: 100,
-		restartCh:   readyCh,
-		readyCh:     readyCh,
+		eventBuffer:       100,
+		barrierTimeout:    defaultBarrierTimeout,
+		heartbeatInterval: defaultHeartbeatInterval,
+		workersByID:       make(map[string]*workerRuntime),
 	}
 
 	for _, opt := range opts {
@@ -66,6 +74,7 @@ func NewSupervisor(opts ...Option) *Supervisor {
 	}
 
 	s.events = make(chan Event, s.eventBuffer)
+	s.restartCh = make(chan restartRequest, 1)
 
 	return s
 }
@@ -85,19 +94,30 @@ func (s *Supervisor) Add(spec WorkerSpec) error {
 		return fmt.Errorf("worker %q run function is required", spec.Name)
 	}
 
+	id := spec.id()
+	if _, exists := s.workersByID[id]; exists {
+		return fmt.Errorf("worker %q already registered", id)
+	}
+
 	rt := &workerRuntime{
-		spec: spec,
+		workerID: id,
+		spec:     spec,
 		state: workerState{
 			Name:   spec.Name,
 			Status: StatusStarting,
 		},
+		// gateCh is created once and never replaced. (Bug 1.2 fix)
+		// Capacity 1: pre-filled so the first run starts immediately.
+		gateCh: make(chan struct{}, 1),
 	}
+	rt.gateCh <- struct{}{}
 
 	s.workers = append(s.workers, rt)
+	s.workersByID[id] = rt
 	return nil
 }
 
-// Start runs all registered workers and blocks until they exit.
+// Start runs all registered workers and blocks until they all exit.
 func (s *Supervisor) Start(parent context.Context) error {
 	s.mu.Lock()
 
@@ -118,6 +138,15 @@ func (s *Supervisor) Start(parent context.Context) error {
 
 	s.mu.Unlock()
 
+	// Start the centralized restart coordinator.
+	s.wg.Add(1)
+	go s.restartLoop()
+
+	// Start the background heartbeat watchdog.
+	s.wg.Add(1)
+	go s.heartbeatWatchdog()
+
+	// Start all worker goroutines.
 	for _, w := range workers {
 		s.wg.Add(1)
 		go s.runWorker(w)
@@ -130,7 +159,7 @@ func (s *Supervisor) Start(parent context.Context) error {
 	return nil
 }
 
-// Stop cancels the supervisor context.
+// Stop cancels the supervisor context, signalling all workers to stop.
 func (s *Supervisor) Stop() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -151,19 +180,23 @@ func (s *Supervisor) Subscribe() <-chan Event {
 	return s.events
 }
 
-// Metrics returns a copy of each worker's counters.
+// Metrics returns a copy of each worker's atomic counters.
 func (s *Supervisor) Metrics() []WorkerMetricsSnapshot {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	workers := make([]*workerRuntime, len(s.workers))
+	copy(workers, s.workers)
+	s.mu.Unlock()
 
-	var out []WorkerMetricsSnapshot
-
-	for _, w := range s.workers {
+	out := make([]WorkerMetricsSnapshot, 0, len(workers))
+	for _, w := range workers {
 		out = append(out, WorkerMetricsSnapshot{
-			Name:     w.spec.Name,
-			Restarts: atomic.LoadInt64(&w.metrics.Restarts),
-			Failures: atomic.LoadInt64(&w.metrics.Failures),
-			Success:  atomic.LoadInt64(&w.metrics.Success),
+			Name:             w.spec.Name,
+			Restarts:         atomic.LoadInt64(&w.metrics.Restarts),
+			Failures:         atomic.LoadInt64(&w.metrics.Failures),
+			Success:          atomic.LoadInt64(&w.metrics.Success),
+			PanicCount:       atomic.LoadInt64(&w.metrics.PanicCount),
+			TimeoutCount:     atomic.LoadInt64(&w.metrics.TimeoutCount),
+			StrategyRestarts: atomic.LoadInt64(&w.metrics.StrategyRestarts),
 			LastLatency: time.Duration(
 				atomic.LoadInt64(&w.metrics.LastLatency),
 			),
@@ -176,16 +209,18 @@ func (s *Supervisor) Metrics() []WorkerMetricsSnapshot {
 func (s *Supervisor) runWorker(w *workerRuntime) {
 	defer s.wg.Done()
 
-	pendingRestart := false
-	var pendingRestartInstanceID int64
-
 	for {
-		ch := s.restartGate(w)
+		// Wait for the gate to open. The first iteration runs immediately
+		// because Add() pre-fills gateCh. For coordinated restarts, the
+		// restartLoop opens the gate only after all workers in the restart
+		// set have fully stopped. (Bug 1.2 fix — gate never replaced)
+		w.setAtGate(true)
 		select {
-		case <-ch:
+		case <-w.gateCh:
+			w.setAtGate(false)
 		case <-s.ctx.Done():
+			w.setAtGate(false)
 			w.setStatus(StatusStopped)
-
 			s.emit(Event{
 				Worker: w.spec.Name,
 				Type:   EventStopped,
@@ -195,8 +230,8 @@ func (s *Supervisor) runWorker(w *workerRuntime) {
 		}
 
 		if s.ctx.Err() != nil {
+			w.setAtGate(false)
 			w.setStatus(StatusStopped)
-
 			s.emit(Event{
 				Worker: w.spec.Name,
 				Type:   EventStopped,
@@ -205,41 +240,20 @@ func (s *Supervisor) runWorker(w *workerRuntime) {
 			return
 		}
 
-		if pendingRestart {
-			w.incrementRestart()
-			w.metricsRestart()
-
-			s.emit(Event{
-				Worker:     w.spec.Name,
-				InstanceID: pendingRestartInstanceID,
-				Type:       EventRestarted,
-				Time:       time.Now(),
-				Restarts:   w.getRestarts(),
-			})
-
-			startCh := s.workerRestartedForRestart(w)
-			select {
-			case <-startCh:
-			case <-s.ctx.Done():
-				w.setStatus(StatusStopped)
-
-				s.emit(Event{
-					Worker: w.spec.Name,
-					Type:   EventStopped,
-					Time:   time.Now(),
-				})
-				return
-			}
-
-			pendingRestart = false
+		// Check if the supervisor has decided this worker should stop permanently
+		// (restart policy exhausted / rate limited during a coordinated cycle).
+		w.mu.Lock()
+		perm := w.permanentStop
+		w.mu.Unlock()
+		if perm {
+			w.setStatus(StatusStopped)
+			return
 		}
 
-		ctx := w.newContext(s.ctx)
-
-		instanceID := w.nextInstance()
+		// Create a fresh execution context for this instance.
+		ctx, instanceID := w.nextInstance(s.ctx)
 
 		w.setStatus(StatusRunning)
-
 		s.emit(Event{
 			Worker:     w.spec.Name,
 			InstanceID: instanceID,
@@ -248,33 +262,26 @@ func (s *Supervisor) runWorker(w *workerRuntime) {
 			Restarts:   w.getRestarts(),
 		})
 
-		execCh := s.workerStartedForRestart(w)
-		select {
-		case <-execCh:
-		case <-s.ctx.Done():
-			w.setStatus(StatusStopped)
-
-			s.emit(Event{
-				Worker:     w.spec.Name,
-				InstanceID: instanceID,
-				Type:       EventStopped,
-				Time:       time.Now(),
-			})
-			return
-		}
-
 		start := time.Now()
-		err := s.safeRun(ctx, w)
+		err, errorKind := s.safeRun(ctx, w)
 		wasCancelled := ctx.Err() != nil
 		duration := time.Since(start)
 
-		// heartbeat check overrides err
-		if !wasCancelled && w.isStuck(w.spec.HeartbeatTTL) {
+		// Heartbeat check: if the worker was cancelled (by the watchdog)
+		// and is stuck, treat it as a timeout failure — not as a coordinated
+		// restart signal. We also allow this path for non-cancelled exits.
+		isHeartbeatTimeout := w.isStuck(w.spec.HeartbeatTTL)
+		if isHeartbeatTimeout {
 			err = fmt.Errorf("worker stuck: no heartbeat")
+			errorKind = "timeout"
+			w.metricsTimeout()
+			// Treat as a non-cancelled failure so the restart logic below
+			// handles it as a self-restart (not a coordinated restart).
+			wasCancelled = false
 		}
 
 		// update execution state
-		w.updateExecution(err, duration)
+		w.updateExecution(err, errorKind, duration)
 
 		// metrics
 		if err != nil && !wasCancelled {
@@ -284,26 +291,55 @@ func (s *Supervisor) runWorker(w *workerRuntime) {
 		}
 		w.metricsLatency(duration)
 
-		// emit failure
+		// emit failure event
 		if err != nil && !wasCancelled {
 			s.emit(Event{
 				Worker:     w.spec.Name,
 				InstanceID: instanceID,
 				Type:       EventFailed,
 				Err:        err,
+				ErrorKind:  errorKind,
 				Time:       time.Now(),
 				Restarts:   w.getRestarts(),
 				Latency:    duration,
 			})
-
-			// apply strategy immediately on failure
-			s.applyStrategy(w)
 		}
 
-		if wasCancelled {
-			if s.ctx.Err() != nil {
-				w.setStatus(StatusStopped)
+		// Global shutdown: context cancelled at supervisor level.
+		if wasCancelled && s.ctx.Err() != nil {
+			w.setStatus(StatusStopped)
+			s.emit(Event{
+				Worker:     w.spec.Name,
+				InstanceID: instanceID,
+				Type:       EventStopped,
+				Time:       time.Now(),
+			})
+			return
+		}
 
+		// Worker was cancelled by restartLoop for coordinated restart.
+		// Loop back — atGate will be set at the top of the next iteration
+		// so restartLoop can detect we are ready.
+		if wasCancelled {
+			w.setStatus(StatusRestarting)
+			s.emit(Event{
+				Worker:     w.spec.Name,
+				InstanceID: instanceID,
+				Type:       EventStopped,
+				Time:       time.Now(),
+			})
+			continue
+		}
+
+		// Worker exited on its own (not cancelled).
+
+		// For coordinated strategies: post to restartLoop which will stop
+		// siblings, wait for all to stop, then open all gates.
+		// For OneForOne: check restart policy and open own gate directly.
+		if s.strategy == OneForOne {
+			// OneForOne: no siblings affected, handle inline.
+			if !s.shouldRestart(w, err) {
+				w.setStatus(StatusStopped)
 				s.emit(Event{
 					Worker:     w.spec.Name,
 					InstanceID: instanceID,
@@ -313,100 +349,413 @@ func (s *Supervisor) runWorker(w *workerRuntime) {
 				return
 			}
 
-			w.setStatus(StatusStopped)
+			if !w.allowRestart() {
+				w.setStatus(StatusStopped)
+				w.setRestartReason(ReasonThrottle)
+				s.emit(Event{
+					Worker:        w.spec.Name,
+					InstanceID:    instanceID,
+					Type:          EventThrottled,
+					Err:           fmt.Errorf("restart throttled"),
+					RestartReason: ReasonThrottle,
+					Time:          time.Now(),
+				})
+				return
+			}
+
+			reason := classifyReason(errorKind)
+			w.setRestartReason(reason)
+			w.incrementRestart()
+			w.metricsRestart()
 
 			s.emit(Event{
-				Worker:     w.spec.Name,
-				InstanceID: instanceID,
-				Type:       EventStopped,
-				Time:       time.Now(),
+				Worker:        w.spec.Name,
+				InstanceID:    instanceID,
+				Type:          EventRestarted,
+				RestartReason: reason,
+				Time:          time.Now(),
+				Restarts:      w.getRestarts(),
 			})
 
-			s.workerStoppedForRestart(w)
-			pendingRestart = true
-			pendingRestartInstanceID = instanceID
+			// Apply backoff before signalling.
+			if !s.applyBackoff(w, instanceID, ctx) {
+				return
+			}
+
+			s.openGate(w)
 			continue
 		}
 
-		s.workerStoppedForRestart(w)
+		// OneForAll / RestForOne: coordinated restart is only triggered on
+		// FAILURE (err != nil). Normal completion restarts the worker inline
+		// (like OneForOne) without disturbing siblings. This matches OTP
+		// semantics where the strategy only fires when a worker crashes.
+		if err == nil {
+			// Normal completion: restart inline if policy allows.
+			if !s.shouldRestart(w, nil) {
+				w.setStatus(StatusStopped)
+				s.emit(Event{
+					Worker:     w.spec.Name,
+					InstanceID: instanceID,
+					Type:       EventStopped,
+					Time:       time.Now(),
+				})
+				return
+			}
 
-		// restart decision
-		if !s.shouldRestart(w, err) {
-			w.setStatus(StatusStopped)
+			if !w.allowRestart() {
+				w.setStatus(StatusStopped)
+				w.setRestartReason(ReasonThrottle)
+				s.emit(Event{
+					Worker:        w.spec.Name,
+					InstanceID:    instanceID,
+					Type:          EventThrottled,
+					Err:           fmt.Errorf("restart throttled"),
+					RestartReason: ReasonThrottle,
+					Time:          time.Now(),
+				})
+				return
+			}
 
+			w.setRestartReason(ReasonNone)
+			w.incrementRestart()
+			w.metricsRestart()
 			s.emit(Event{
 				Worker:     w.spec.Name,
 				InstanceID: instanceID,
-				Type:       EventStopped,
+				Type:       EventRestarted,
 				Time:       time.Now(),
+				Restarts:   w.getRestarts(),
 			})
-			s.workerSkippedRestart(w)
+
+			if !s.applyBackoff(w, instanceID, ctx) {
+				return
+			}
+			s.openGate(w)
+			continue
+		}
+
+		// Failure path: post to centralized restart loop.
+		// The worker will loop back to gateCh and wait.
+		reason := classifyReason(errorKind)
+		w.setRestartReason(reason)
+
+		// Apply backoff before the coordinated restart so siblings aren't
+		// held up needlessly by one worker's backoff.
+		if !s.applyBackoff(w, instanceID, ctx) {
 			return
 		}
 
-		// throttling
-		if !w.allowRestart() {
-			w.setStatus(StatusStopped)
+		s.postRestart(w, reason)
 
-			s.emit(Event{
-				Worker:     w.spec.Name,
-				InstanceID: instanceID,
-				Type:       EventThrottled,
-				Err:        fmt.Errorf("restart throttled"),
-				Time:       time.Now(),
-			})
-			s.workerSkippedRestart(w)
-			return
+		// Loop back to gateCh — restartLoop opens it after coordination.
+	}
+}
+
+// applyBackoff sleeps for the configured backoff duration.
+// Returns false if the supervisor shut down during the sleep (caller should return).
+func (s *Supervisor) applyBackoff(w *workerRuntime, instanceID int64, ctx context.Context) bool {
+	if w.spec.Backoff == nil {
+		return true
+	}
+
+	delay := w.spec.Backoff.Next(w.getRestarts())
+	if delay <= 0 {
+		return true
+	}
+
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		return true
+	case <-s.ctx.Done():
+		w.setStatus(StatusStopped)
+		s.emit(Event{
+			Worker:     w.spec.Name,
+			InstanceID: instanceID,
+			Type:       EventStopped,
+			Time:       time.Now(),
+		})
+		return false
+	}
+}
+
+// postRestart coalesces restart requests to the centralized loop. (Bug 1.4 fix)
+func (s *Supervisor) postRestart(trigger *workerRuntime, reason RestartReason) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.restartPending {
+		// A restart cycle is already queued; discard duplicate.
+		return
+	}
+	s.restartPending = true
+	s.restartCh <- restartRequest{trigger: trigger, reason: reason}
+}
+
+func (s *Supervisor) safeRun(ctx context.Context, w *workerRuntime) (err error, kind string) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic: %v", r)
+			kind = "panic"
+			w.metricsPanic()
 		}
+	}()
 
-		pendingRestart = true
-		pendingRestartInstanceID = instanceID
+	runErr := w.spec.Run(ctx, w.heartbeat)
+	if runErr != nil {
+		return runErr, "error"
+	}
+	return nil, ""
+}
 
-		// backoff
-		if w.spec.Backoff != nil {
-			delay := w.spec.Backoff.Next(w.getRestarts())
+func (s *Supervisor) restartLoop() {
+	defer s.wg.Done()
 
-			timer := time.NewTimer(delay)
-			select {
-			case <-timer.C:
-				timer.Stop()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
 
-			case <-ctx.Done():
-				timer.Stop()
+		case req := <-s.restartCh:
+			// Keep restartPending=true until the full cycle completes so
+			// that any failures during the cycle are coalesced, not queued
+			// as a second overlapping cycle. (Bug 1.4 fix)
+			s.runRestartCycle(req)
 
-				// check if supervisor is shutting down
-				if s.ctx.Err() != nil {
-					w.setStatus(StatusStopped)
+			s.mu.Lock()
+			s.restartPending = false
+			s.mu.Unlock()
+		}
+	}
+}
 
-					s.emit(Event{
-						Worker:     w.spec.Name,
-						InstanceID: instanceID,
-						Type:       EventStopped,
-						Time:       time.Now(),
-					})
+// runRestartCycle executes one full coordinated restart.
+func (s *Supervisor) runRestartCycle(req restartRequest) {
+	s.mu.Lock()
+	workers := make([]*workerRuntime, len(s.workers))
+	copy(workers, s.workers)
+	strategy := s.strategy
+	s.mu.Unlock()
+
+	// Determine which workers to include in the restart set.
+	var toRestart []*workerRuntime
+	switch strategy {
+	case OneForAll:
+		toRestart = workers
+	case RestForOne:
+		found := false
+		for _, w := range workers {
+			if w == req.trigger {
+				found = true
+			}
+			if found {
+				toRestart = append(toRestart, w)
+			}
+		}
+	default:
+		return
+	}
+
+	// Mark non-trigger workers with the strategy reason.
+	for _, w := range toRestart {
+		if w != req.trigger {
+			w.setRestartReason(ReasonStrategy)
+			w.metricsStrategyRestart()
+		}
+	}
+
+	// Stop all workers in the restart set.
+	// The trigger has already exited; cancel it anyway (no-op safe via instanceID check).
+	instanceIDs := make(map[string]int64, len(toRestart))
+	for _, w := range toRestart {
+		id := w.currentInstanceID()
+		instanceIDs[w.workerID] = id
+		if w != req.trigger {
+			w.setStatus(StatusStopping)
+			w.cancelInstance(id)
+		}
+	}
+
+	// Wait for all workers in the restart set to have reached the gate
+	// (i.e., they have finished their current run and are blocked waiting).
+	// Uses the atGate flag rather than isStopped to correctly handle the
+	// trigger worker which exited without cancellation. (Bug 1.1 fix)
+	deadline := time.Now().Add(s.barrierTimeout)
+	allStoppedCh := make(chan struct{})
+
+	go func() {
+		for _, w := range toRestart {
+			for !w.isAtGate() {
+				if time.Now().After(deadline) {
 					return
 				}
+				time.Sleep(2 * time.Millisecond)
+			}
+		}
+		close(allStoppedCh)
+	}()
 
-				w.setStatus(StatusStopped)
-				s.workerStoppedForRestart(w)
-				continue
+	timedOut := false
+	select {
+	case <-allStoppedCh:
+		// All workers cleanly stopped.
+	case <-time.After(time.Until(deadline)):
+		// Watchdog fired: force-release. (Bug 1.1 fix)
+		timedOut = true
+		s.emit(Event{
+			Type: EventBarrierTimeout,
+			Time: time.Now(),
+		})
+	case <-s.ctx.Done():
+		return
+	}
+	_ = timedOut
+
+	// Now open gates in the correct order, but only after emitting EventRestarted
+	// for all restarting workers first. This preserves the ordering invariant:
+	// EventRestarted is always emitted before the corresponding EventStarted.
+
+	// Determine which workers will actually restart (vs. exit due to policy).
+	type workerDecision struct {
+		w         *workerRuntime
+		willReset bool
+	}
+	decisions := make([]workerDecision, 0, len(toRestart))
+	for _, w := range toRestart {
+		w.mu.Lock()
+		lastErr := w.state.LastError
+		w.mu.Unlock()
+
+		willRestart := s.shouldRestart(w, lastErr) && w.allowRestart()
+		decisions = append(decisions, workerDecision{w: w, willReset: willRestart})
+	}
+
+	// Emit EventRestarted for all workers that WILL restart, before opening any gate.
+	for _, d := range decisions {
+		if !d.willReset {
+			continue
+		}
+		d.w.incrementRestart()
+		d.w.metricsRestart()
+		s.emit(Event{
+			Worker:        d.w.spec.Name,
+			InstanceID:    instanceIDs[d.w.workerID],
+			Type:          EventRestarted,
+			RestartReason: req.reason,
+			Time:          time.Now(),
+			Restarts:      d.w.getRestarts(),
+		})
+	}
+
+	// Now open gates / finalise workers.
+	for _, d := range decisions {
+		if d.willReset {
+			// Open the gate; the worker is blocked on it and will restart.
+			s.openGate(d.w)
+		} else {
+			// Worker won't restart: set permanentStop so it exits when it
+			// wakes from the gate, then open the gate to wake it.
+			d.w.mu.Lock()
+			d.w.permanentStop = true
+			d.w.mu.Unlock()
+
+			if !s.shouldRestart(d.w, d.w.state.LastError) {
+				s.emit(Event{
+					Worker:     d.w.spec.Name,
+					InstanceID: instanceIDs[d.w.workerID],
+					Type:       EventStopped,
+					Time:       time.Now(),
+				})
+			} else {
+				// Rate-limited.
+				d.w.setRestartReason(ReasonThrottle)
+				s.emit(Event{
+					Worker:        d.w.spec.Name,
+					InstanceID:    instanceIDs[d.w.workerID],
+					Type:          EventThrottled,
+					Err:           fmt.Errorf("restart throttled"),
+					RestartReason: ReasonThrottle,
+					Time:          time.Now(),
+				})
+			}
+
+			s.openGate(d.w)
+		}
+	}
+}
+
+// openGate signals a worker's gate channel without blocking.
+// The channel has capacity 1; if already full, the worker will get
+// the existing token (no loss of signal).
+func (s *Supervisor) openGate(w *workerRuntime) {
+	select {
+	case w.gateCh <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Supervisor) heartbeatWatchdog() {
+	defer s.wg.Done()
+
+	ticker := time.NewTicker(s.heartbeatInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+
+		case <-ticker.C:
+			s.mu.Lock()
+			workers := make([]*workerRuntime, len(s.workers))
+			copy(workers, s.workers)
+			s.mu.Unlock()
+
+			for _, w := range workers {
+				ttl := w.spec.HeartbeatTTL
+				if ttl == 0 {
+					continue
+				}
+
+				w.mu.Lock()
+				status := w.state.Status
+				w.mu.Unlock()
+
+				if status != StatusRunning {
+					continue
+				}
+
+				if w.isStuck(ttl) {
+					id := w.currentInstanceID()
+					// Cancel the stuck instance; runWorker will detect
+					// the timeout on its next evaluation.
+					w.cancelInstance(id)
+				}
 			}
 		}
 	}
 }
 
-func (s *Supervisor) stopWorker(w *workerRuntime) {
-	w.cancelInstance()
-}
+func (s *Supervisor) shouldRestart(w *workerRuntime, err error) bool {
+	spec := w.spec
 
-func (s *Supervisor) safeRun(ctx context.Context, w *workerRuntime) (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("panic: %v", r)
-		}
-	}()
+	if spec.MaxRestarts > 0 && w.getRestarts() >= spec.MaxRestarts {
+		return false
+	}
 
-	return w.spec.Run(ctx, w.heartbeat)
+	switch spec.Restart {
+	case RestartAlways:
+		return true
+	case RestartOnFailure:
+		return err != nil
+	case RestartNever:
+		return false
+	}
+
+	return false
 }
 
 func (s *Supervisor) emit(e Event) {
@@ -417,285 +766,18 @@ func (s *Supervisor) emit(e Event) {
 	select {
 	case s.events <- e:
 	default:
-		// drop event if full
+		atomic.AddInt64(&s.droppedEvents, 1)
 	}
 }
 
-func (s *Supervisor) restartGate(w *workerRuntime) <-chan struct{} {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.restartHold && s.barrier != nil {
-		if ch, ok := s.barrier.restartGates[w]; ok {
-			return ch
-		}
-		return s.readyCh
+// classifyReason maps an errorKind string to a RestartReason.
+func classifyReason(errorKind string) RestartReason {
+	switch errorKind {
+	case "panic":
+		return ReasonPanic
+	case "timeout":
+		return ReasonTimeout
+	default:
+		return ReasonFailure
 	}
-
-	return s.restartCh
-}
-
-func (s *Supervisor) applyStrategy(failed *workerRuntime) {
-	s.mu.Lock()
-
-	var toStop []*workerRuntime
-
-	switch s.strategy {
-
-	case OneForOne:
-		s.mu.Unlock()
-		return
-
-	case OneForAll:
-		for _, w := range s.workers {
-			toStop = append(toStop, w)
-		}
-		s.holdRestartsLocked(toStop, false)
-
-	case RestForOne:
-		found := false
-		for _, w := range s.workers {
-			if w == failed {
-				found = true
-			}
-			if found {
-				toStop = append(toStop, w)
-			}
-		}
-		s.holdRestartsLocked(toStop, true)
-	}
-
-	s.mu.Unlock()
-
-	for _, w := range toStop {
-		s.stopWorker(w)
-	}
-}
-
-func (s *Supervisor) holdRestartsLocked(workers []*workerRuntime, ordered bool) {
-	if !s.restartHold {
-		s.restartCh = make(chan struct{})
-		s.restartHold = true
-		s.barrier = &restartBarrier{
-			pending:      make(map[*workerRuntime]struct{}, len(workers)),
-			restartGates: make(map[*workerRuntime]chan struct{}, len(workers)),
-			startGates:   make(map[*workerRuntime]chan struct{}, len(workers)),
-			execGates:    make(map[*workerRuntime]chan struct{}, len(workers)),
-			restarted:    make(map[*workerRuntime]struct{}, len(workers)),
-			started:      make(map[*workerRuntime]struct{}, len(workers)),
-			skipped:      make(map[*workerRuntime]struct{}, len(workers)),
-			ordered:      ordered,
-		}
-	} else if ordered {
-		s.barrier.ordered = true
-	}
-
-	for _, w := range workers {
-		if w.isStopped() {
-			continue
-		}
-		if _, ok := s.barrier.restartGates[w]; !ok {
-			s.barrier.restartGates[w] = make(chan struct{})
-			s.barrier.startGates[w] = make(chan struct{})
-			s.barrier.execGates[w] = make(chan struct{})
-			s.barrier.order = append(s.barrier.order, w)
-		}
-		s.barrier.pending[w] = struct{}{}
-	}
-
-	if len(s.barrier.pending) == 0 {
-		s.releaseRestartPhaseLocked()
-	}
-}
-
-func (s *Supervisor) workerStoppedForRestart(w *workerRuntime) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if !s.restartHold || s.barrier == nil {
-		return
-	}
-
-	if _, ok := s.barrier.pending[w]; !ok {
-		return
-	}
-
-	delete(s.barrier.pending, w)
-	if len(s.barrier.pending) > 0 {
-		return
-	}
-
-	s.releaseRestartPhaseLocked()
-}
-
-func (s *Supervisor) workerRestartedForRestart(w *workerRuntime) <-chan struct{} {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if !s.restartHold || s.barrier == nil {
-		return s.readyCh
-	}
-
-	ch, ok := s.barrier.startGates[w]
-	if !ok {
-		return s.readyCh
-	}
-
-	s.barrier.restarted[w] = struct{}{}
-	if s.barrier.ordered {
-		s.releaseRestartPhaseLocked()
-	}
-	if s.restartPhaseCompleteLocked() {
-		s.releaseStartPhaseLocked()
-	}
-
-	return ch
-}
-
-func (s *Supervisor) workerStartedForRestart(w *workerRuntime) <-chan struct{} {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if !s.restartHold || s.barrier == nil {
-		return s.readyCh
-	}
-
-	ch, ok := s.barrier.execGates[w]
-	if !ok {
-		return s.readyCh
-	}
-
-	s.barrier.started[w] = struct{}{}
-	if s.barrier.ordered {
-		s.releaseStartPhaseLocked()
-	}
-	if s.startPhaseCompleteLocked() {
-		s.releaseExecPhaseLocked()
-	}
-
-	return ch
-}
-
-func (s *Supervisor) workerSkippedRestart(w *workerRuntime) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if !s.restartHold || s.barrier == nil {
-		return
-	}
-
-	s.barrier.skipped[w] = struct{}{}
-	if s.barrier.ordered {
-		s.releaseRestartPhaseLocked()
-		s.releaseStartPhaseLocked()
-	}
-	if s.restartPhaseCompleteLocked() {
-		s.releaseStartPhaseLocked()
-	}
-	if s.startPhaseCompleteLocked() {
-		s.releaseExecPhaseLocked()
-	}
-}
-
-func (s *Supervisor) restartPhaseCompleteLocked() bool {
-	if !s.restartHold || s.barrier == nil {
-		return false
-	}
-
-	return len(s.barrier.restarted)+len(s.barrier.skipped) >= len(s.barrier.order)
-}
-
-func (s *Supervisor) startPhaseCompleteLocked() bool {
-	if !s.restartHold || s.barrier == nil {
-		return false
-	}
-
-	return len(s.barrier.started)+len(s.barrier.skipped) >= len(s.barrier.order)
-}
-
-func (s *Supervisor) releaseRestartPhaseLocked() {
-	if !s.restartHold || s.barrier == nil {
-		return
-	}
-
-	if !s.barrier.ordered {
-		for _, ch := range s.barrier.restartGates {
-			close(ch)
-		}
-		s.barrier.restartGates = nil
-		return
-	}
-
-	for s.barrier.nextRestart < len(s.barrier.order) {
-		w := s.barrier.order[s.barrier.nextRestart]
-		s.barrier.nextRestart++
-
-		if _, skipped := s.barrier.skipped[w]; skipped {
-			continue
-		}
-
-		ch, ok := s.barrier.restartGates[w]
-		if !ok {
-			continue
-		}
-
-		delete(s.barrier.restartGates, w)
-		close(ch)
-		return
-	}
-}
-
-func (s *Supervisor) releaseStartPhaseLocked() {
-	if !s.restartHold || s.barrier == nil {
-		return
-	}
-
-	if !s.restartPhaseCompleteLocked() {
-		return
-	}
-
-	if !s.barrier.ordered {
-		for _, ch := range s.barrier.startGates {
-			close(ch)
-		}
-		s.barrier.startGates = nil
-		return
-	}
-
-	for s.barrier.nextStart < len(s.barrier.order) {
-		w := s.barrier.order[s.barrier.nextStart]
-		s.barrier.nextStart++
-
-		if _, skipped := s.barrier.skipped[w]; skipped {
-			continue
-		}
-
-		ch, ok := s.barrier.startGates[w]
-		if !ok {
-			continue
-		}
-
-		delete(s.barrier.startGates, w)
-		close(ch)
-		return
-	}
-}
-
-func (s *Supervisor) releaseExecPhaseLocked() {
-	if !s.restartHold || s.barrier == nil {
-		return
-	}
-
-	if !s.startPhaseCompleteLocked() {
-		return
-	}
-
-	for _, ch := range s.barrier.execGates {
-		close(ch)
-	}
-
-	close(s.restartCh)
-	s.restartCh = s.readyCh
-	s.restartHold = false
-	s.barrier = nil
 }

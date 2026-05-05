@@ -2,6 +2,7 @@
 *.exe
 *.out
 *.test
+*.log
 
 # Go build
 bin/
@@ -13,3 +14,5 @@ dist/
 
 # OS
 .DS_Store
+
+.examples
